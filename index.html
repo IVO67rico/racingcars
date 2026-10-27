@@ -149,4 +149,375 @@ function initGaragePreview(){  const canvas=$("garage3d");  if(!canvas || garage
   shadow.userData.sharedCarGeometry=false;
   g.add(shadow);
   return g;
-}function animate(){  if(!renderer || !scene) return;  animationHandle=requestAnimationFrame(animate);  const dt=Math.min(clock.getDelta(),.045);  if(raceStarted && !raceFinished){ updateRace(dt); }  updateCamera(dt);  renderer.render(scene,camera);}function updateRace(dt){  updatePlayer(dt); updateAI(dt); resolveCollisions(dt); updateCollectibles(dt); updateEffects(dt); updateEngineSound(); updateHUD(); updateMinimap();  if(!freeDriveMode && (player.finished || racers.every(r=>r.finished))) finishRace();}function updatePlayer(dt){  const st=player.stats;  const boostActive = player.boostTime > 0;  const acc = (keys["w"]||keys["arrowup"]) ? st.acceleration * (boostActive ? 2.05 : 1) : 0;  const brake = (keys["s"]||keys["arrowdown"]) ? 1 : 0;  const hand = keys[" "] ? 1 : 0;  if(!player.finished){    if(acc) player.speed += acc*dt;    if(brake) player.speed -= (player.speed>0?st.acceleration*1.35:st.acceleration*.55)*dt;    const offroad = player.distanceFromCenter > trackData.width*.52;    const drag = offroad ? .935 : (hand ? .955 : .986);    player.speed *= Math.pow(drag, dt*60);    const damageFactor = THREE.MathUtils.clamp(1 - (player.damage||0)*.0035, .72, 1);    const currentMax = (boostActive ? st.maxSpeed*1.42 : st.maxSpeed) * damageFactor;    player.speed = THREE.MathUtils.clamp(player.speed, -st.maxSpeed*.35, currentMax);    const steer = (keys["a"]||keys["arrowleft"]?1:0) - (keys["d"]||keys["arrowright"]?1:0);    const steerPower = st.handling * (0.50 + Math.min(Math.abs(player.speed)/st.maxSpeed,1)*.95) * (player.speed>=0?1:-1);    player.yaw += steer * steerPower * dt * (hand?1.65:1.18);    player.yaw += player.collisionSpin * dt;    player.collisionSpin *= Math.pow(.72,dt*60);    player.group.rotation.y = player.yaw;    player.group.position.x -= Math.sin(player.yaw)*player.speed*dt;    player.group.position.z -= Math.cos(player.yaw)*player.speed*dt;    player.group.position.addScaledVector(player.hitVelocity,dt);    player.hitVelocity.multiplyScalar(Math.pow(.78,dt*60));    if(player.boostTime>0){      player.boostTime=Math.max(0,player.boostTime-dt);    }else{      const movingBonus = Math.min(Math.abs(player.speed)/Math.max(1,st.maxSpeed),1)*.035;      player.boostEnergy = Math.min(1, (player.boostEnergy ?? 1) + dt*(.075 + movingBonus));    }    setTurboFlames(player, boostActive);    const drifting = Math.abs(steer)>0 && Math.abs(player.speed)>18 && (hand || Math.abs(steerPower)>1.2);    if(drifting){ spawnSmoke(player.group.position, racerForward(player), false); addSkidMark(player.group.position, player.yaw); raceStats.driftTime+=dt; }    const info=distanceToTrack(player.group.position); player.distanceFromCenter=info.dist;    handleTrackBarrier(player, info);    const norm=info.along/trackData.totalLength;    if(norm<.15 && player.lastNorm>.85 && player.speed>3){      player.lap++;      const now=clock.getElapsedTime()-startTime;      const lapTime=now-(raceStats.lastLapTime||0);      raceStats.lastLapTime=now;      if(player.lap>0){ raceStats.lapTimes.push(lapTime); raceStats.bestLap = raceStats.bestLap==null ? lapTime : Math.min(raceStats.bestLap, lapTime); }    }    if(norm>.85 && player.lastNorm<.15 && player.speed<-5){ player.lap=Math.max(0,player.lap-1); }    player.lastNorm=norm; player.progress=player.lap*trackData.totalLength + info.along;    if(player.lap>=trackData.laps && !player.finished){ player.finished=true; player.finishTime=clock.getElapsedTime()-startTime; player.speed=0; }  }}function updateAI(dt){  const diff=parseFloat($("difficultySelect").value);  for(const ai of aiCars){    if(ai.finished) continue;    const turn = upcomingTurn(ai.progress);    const trackIndex = TRACK_ORDER.indexOf(selectedTrackId);    const lapPenalty = ai.lap===0 && selectedTrackId==="coast" ? .94 : 1;    const baseTarget = ai.stats.maxSpeed * diff * ai.skill * lapPenalty * (1 - Math.min(.60,turn*.86));    ai.speed += (baseTarget-ai.speed)*dt*(.34+ai.stats.acceleration/95);    ai.progress += ai.speed*dt;    ai.collisionSpin *= Math.pow(.78,dt*60);    const pose=poseAtDistance(ai.progress,ai.offset + Math.sin(ai.progress*.035+ai.skill*3)*.55);    ai.group.position.copy(pose.pos).addScaledVector(ai.hitVelocity,dt); ai.group.rotation.y=pose.yaw + ai.collisionSpin;    ai.hitVelocity.multiplyScalar(Math.pow(.80,dt*60));    ai.lap=Math.max(0,Math.floor(ai.progress/trackData.totalLength));    if(ai.progress >= trackData.totalLength*trackData.laps + 4 && !ai.finished){ ai.finished=true; ai.finishTime=clock.getElapsedTime()-startTime; }  }}function upcomingTurn(progress){  const a=poseAtDistance(progress,0).tangent; const b=poseAtDistance(progress+28,0).tangent;  return a.angleTo(b)/Math.PI;}function poseAtDistance(distance, offset=0){  const L=trackData.totalLength; let d=((distance%L)+L)%L;  let idx=0;  const arr=trackData.lengths;  let lo=0,hi=arr.length-1;  while(lo<=hi){ const mid=(lo+hi)>>1; if(arr[mid]<d){idx=mid; lo=mid+1;} else hi=mid-1; }  const p=trackData.samples[idx].clone(); const t=trackData.tangents[idx].clone(); const n=new THREE.Vector3(-t.z,0,t.x);  p.addScaledVector(n,offset); p.y=.45;  return {pos:p,tangent:t,yaw:Math.atan2(-t.x,-t.z)};}function distanceToTrack(pos){  let best=Infinity, bestIdx=0;  for(let i=0;i<trackData.samples.length;i+=3){    const p=trackData.samples[i]; const dx=pos.x-p.x, dz=pos.z-p.z; const ds=dx*dx+dz*dz;    if(ds<best){best=ds; bestIdx=i;}  }  return {dist:Math.sqrt(best), index:bestIdx, along:trackData.lengths[Math.min(bestIdx,trackData.lengths.length-1)]};}function getOrder(){  return [...racers].sort((a,b)=>{    if(a.finished && b.finished) return a.finishTime-b.finishTime;    if(a.finished) return -1;    if(b.finished) return 1;    return b.progress-a.progress;  });}function updateHUD(){  const order=getOrder(); const pos=order.findIndex(r=>r.id==="player")+1;  $("hudPosition").textContent=`${pos}/${racers.length}`;  $("hudLap").textContent=`${Math.min(player.lap+1,trackData.laps)}/${trackData.laps}`;  $("lapCornerText").textContent=`${Math.min(player.lap+1,trackData.laps)}/${trackData.laps}`;  if($("damageText")) $("damageText").textContent=`${Math.round(player.damage||0)}%`;  if($("bestLapText")) $("bestLapText").textContent=raceStats.bestLap?formatTime(raceStats.bestLap):(save.records?.[selectedTrackId]?formatTime(save.records[selectedTrackId]):"--");  if($("missionText")) $("missionText").textContent=(raceStats.crashes===0?"Vuelta limpia":"Evita choques") + (raceStats.turbos>=3?" + Turbo x3":"") + (raceStats.driftTime>=4?" + Drift":"") + ((raceStats.jumps||0)>0?" + Salto":"");  $("hudSpeed").textContent=Math.max(0,Math.round(Math.abs(player.speed)*5.4));  updateBoostUI();  let html=""; order.forEach((r,i)=>{ html+=`<div class="rankLine ${r.id==="player"?"me":""}"><span>${i+1}. ${r.name}</span><span>${r.finished?formatTime(r.finishTime):"v"+(Math.min(r.lap+1,trackData.laps))}</span></div>`; });  if(html!==lastRankHTML){ $("rankList").innerHTML=html; lastRankHTML=html; }}function cycleCamera(){  const modes=["follow","hood","top"];  cameraMode=modes[(modes.indexOf(cameraMode)+1)%modes.length];  if($("cameraModeSelect")) $("cameraModeSelect").value=cameraMode;}function updateCamera(dt){  if(!player?.group || !camera) return;  const carPos=player.group.position;  let target, look;  if(cameraMode==="hood"){    target=tmpVec.copy(carPos).add(new THREE.Vector3(-Math.sin(player.yaw)*1.2,1.55,-Math.cos(player.yaw)*1.2));    look=new THREE.Vector3(carPos.x-Math.sin(player.yaw)*18,carPos.y+1.1,carPos.z-Math.cos(player.yaw)*18);  }else if(cameraMode==="top"){    target=tmpVec.copy(carPos).add(new THREE.Vector3(0,28,0));    look=new THREE.Vector3(carPos.x,carPos.y,carPos.z);  }else{    const behind=new THREE.Vector3(Math.sin(player.yaw)*9,5.2,Math.cos(player.yaw)*9);    target=tmpVec.copy(carPos).add(behind); target.y+=1.8;    look=new THREE.Vector3(carPos.x,carPos.y+1.1,carPos.z);  }  camera.position.lerp(target,1-Math.pow(.001,dt));  camera.lookAt(look);}function formatTime(t){  if(t==null) return "--"; const m=Math.floor(t/60); const s=(t%60).toFixed(2).padStart(5,"0"); return `${m}:${s}`;}function finishRace(){  raceFinished=true; stopEngineSound(); $("boostButton").style.display="none"; $("quitRaceBtn").style.display="none"; $("cameraBtn").style.display="none"; $("musicBtn").style.display="none"; $("lapCorner").style.display="none"; $("miniMap").style.display="none"; $("raceExtra").style.display="none"; $("hud").style.display="none"; const order=getOrder(); const playerPos=order.findIndex(r=>r.id==="player")+1;  let reward = racePrize(playerPos, selectedTrackId);  const oldUnlocked=save.unlockedTracks.length;  if(player.finishTime && (!save.records[selectedTrackId] || player.finishTime < save.records[selectedTrackId])) save.records[selectedTrackId]=player.finishTime;  updateChampionship(order);  if(reward>0){ save.coins += reward; applyRaceBonuses(playerPos); }  if(playerPos===1){     unlockNextTrack();     if(selectedTrackId==="city" && !hasCar("legend1")){ save.ownedCars.push("legend1"); save.achievements.bossShadow=true; }    if(selectedTrackId==="volcano" && !hasCar("legend2")){ save.ownedCars.push("legend2"); save.achievements.champion=true; }  }  if(Object.values(save.achievements||{}).filter(Boolean).length>=6 && !hasCar("legend3")){ save.ownedCars.push("legend3"); toast(" Auto legendario desbloqueado: Crystal Phantom"); }  if(save.unlockedTracks.length===TRACK_ORDER.length) save.achievements.allTracks=true;  saveGame();  $("finishSubtitle").textContent = playerPos<=3 ? `Terminaste ${playerPos}.º y subiste en el campeonato.` : `Terminaste ${playerPos}.º. Necesitas podio para ganar monedas y 1.º lugar para desbloquear pistas.`;  let podium=`<div class="finishBanner"> Carrera terminada · Podio oficial</div><div class="podiumWrap">`;  const top3=order.slice(0,3);  const slots=[top3[1],top3[0],top3[2]];  const labels=[" 2.º"," 1.º"," 3.º"];  slots.forEach((r,i)=>{ if(!r) return; podium+=`<div class="podiumCard ${i===1?"first":""}"><div class="podiumRank">${labels[i]}</div><div class="podiumName">${r.name}</div><div class="podiumTime">${r.finished?formatTime(r.finishTime):"No terminó"}</div></div>`; });  podium+=`</div>`;  let table=podium+`<table class="results"><thead><tr><th>Puesto</th><th>Piloto</th><th>Tiempo</th><th>Auto</th></tr></thead><tbody>`;  order.forEach((r,i)=>{ const carName=CARS[r.carId]?.name || "IA"; table+=`<tr class="${r.id==="player"?"me":""}"><td>${i+1}</td><td>${r.name}</td><td>${r.finished ? formatTime(r.finishTime) : "No terminó"}</td><td>${carName}</td></tr>`; });  table+=`</tbody></table>`; $("resultsTable").innerHTML=table + `<div class="recordBox"><b> Récord de ${TRACKS[selectedTrackId].name}</b><br>Mejor tiempo guardado: ${save.records[selectedTrackId]?formatTime(save.records[selectedTrackId]):"--"}<br>Mejor vuelta de esta carrera: ${raceStats.bestLap?formatTime(raceStats.bestLap):"--"}</div>` + missionHTML(playerPos) + championshipHTML();  const pr = TRACK_REWARDS[selectedTrackId] || TRACK_REWARDS.coast;  $("rewardBox").textContent = reward>0 ? `Ganaste ${reward} monedas. Premios de esta pista: 1.º ${pr.first}, 2.º ${pr.second}, 3.º ${pr.third}. Total actual: ${save.coins} monedas. Saltos: ${raceStats.jumps||0}. Destrucción: ${raceStats.destruction||0}.` : `No ganaste monedas esta vez. Premios de esta pista: 1.º ${pr.first}, 2.º ${pr.second}, 3.º ${pr.third}. Total actual: ${save.coins} monedas. Saltos: ${raceStats.jumps||0}. Destrucción: ${raceStats.destruction||0}.`;  if(save.unlockedTracks.length>oldUnlocked){ const last=save.unlockedTracks[save.unlockedTracks.length-1]; $("unlockBox").style.display="block"; $("unlockBox").textContent=`Ganaste la carrera. Nueva pista desbloqueada: ${TRACKS[last].name}.`; } else { $("unlockBox").style.display="none"; }  $("coinTextEnd").textContent=save.coins; $("finishModal").style.display="flex"; launchConfetti();}function launchConfetti(){  const old=document.querySelectorAll('.confettiBit'); old.forEach(x=>x.remove());  for(let i=0;i<70;i++){    const d=document.createElement('div'); d.className='confettiBit';    d.style.position='fixed'; d.style.left=(Math.random()*100)+'vw'; d.style.top='-20px'; d.style.width='8px'; d.style.height='14px'; d.style.borderRadius='3px'; d.style.zIndex='50'; d.style.background=['#ffcc00','#00e5ff','#ff4d61','#52ff9a','#ffffff'][i%5]; d.style.pointerEvents='none';    d.style.transform=`rotate(${Math.random()*360}deg)`; d.style.transition=`transform ${1.8+Math.random()*1.4}s linear, top ${1.8+Math.random()*1.4}s ease-in`;    document.body.appendChild(d);    requestAnimationFrame(()=>{ d.style.top='105vh'; d.style.transform=`translateX(${(Math.random()-.5)*200}px) rotate(${Math.random()*900}deg)`; });    setTimeout(()=>d.remove(),3600);  }}function applyRaceBonuses(playerPos){  save.achievements=save.achievements||{};  if(playerPos===1) save.achievements.firstWin=true;  if(raceStats.crashes===0) save.achievements.cleanRace=true;  if(raceStats.turbos>=3) save.achievements.turboMaster=true;  if((save.discovered?.boxes||0)>=5) save.achievements.collector=true;  if(selectedTrackId==="volcano" && playerPos===1) save.achievements.champion=true;  if(save.unlockedTracks.length>=TRACK_ORDER.length) save.achievements.allTracks=true;  const missionBonus=(raceStats.crashes===0?45:0)+(raceStats.turbos>=3?55:0)+(raceStats.driftTime>=4?60:0);  if(missionBonus>0) save.coins+=missionBonus;}function unlockNextTrack(){  for(const id of TRACK_ORDER){ if(!save.unlockedTracks.includes(id)){ save.unlockedTracks.push(id); return; } }}function activateBoost(){  if(!raceStarted || raceFinished || !player || player.finished) return;  if((player.boostEnergy ?? 0) < 1 || player.boostTime>0) return;  player.boostEnergy = 0;  player.boostTime=2.35;  raceStats.turbos++;  player.speed=Math.max(player.speed, player.stats.maxSpeed*.55);  player.hitVelocity.add(racerForward(player).multiplyScalar(13));  spawnBoostBurst(player.group.position); playBoostSound();  updateBoostUI();}function updateBoostUI(){  if(!player) return;  const energy = THREE.MathUtils.clamp(player.boostEnergy ?? 0,0,1);  const percent = Math.round(energy*100);  const ready = energy >= 1 && player.boostTime<=0 && raceStarted && !raceFinished && !player.finished;  $("hudTurbo").textContent = player.boostTime>0 ? "ACTIVO" : `${percent}%`;  $("turboFill").style.width = `${percent}%`;  $("turboLabel").textContent = player.boostTime>0 ? " TURBO ACTIVADO" : (ready ? " TURBO LISTO" : ` CARGANDO ${percent}%`);  const btn=$("boostButton");  btn.disabled = !ready;  btn.classList.toggle("active", player.boostTime>0);  btn.classList.toggle("ready", ready);  document.querySelectorAll('[data-action="boost"]').forEach(b=>b.classList.toggle("ready", ready));  setTurboFlames(player, player.boostTime>0);}function setTurboFlames(racer,on){  const flames=racer?.group?.userData?.turboFlames || [];  for(const f of flames){ f.visible=!!on; if(on){ const s=.75+Math.random()*.6; f.scale.set(s,s,s); }}}function carMass(id){  if(["monster","truck","pickup","suv","police2"].includes(id)) return 1850;  if(["muscle","drag","classic1","classic2"].includes(id)) return 1420;  if(["rally","rally2","snow","beach"].includes(id)) return 1280;  if(["formula","formula2","prototype","proto2","hyper","hyper2","hyper3","moon","void"].includes(id)) return 1080;  return 1210;}function racerForward(r){  return new THREE.Vector3(-Math.sin(r.yaw ?? r.group.rotation.y),0,-Math.cos(r.yaw ?? r.group.rotation.y)).normalize();}function racerVelocity(r){  const forward=racerForward(r);  return forward.multiplyScalar(r.speed || 0).add(r.hitVelocity || new THREE.Vector3());}function clampRacerSpeed(r){  const max=r.id==="player" && r.boostTime>0 ? r.stats.maxSpeed*1.42 : r.stats.maxSpeed;  r.speed=THREE.MathUtils.clamp(r.speed,-r.stats.maxSpeed*.35,max);}function pushRacer(r,pushVec){  if(r.id==="player"){    r.group.position.add(pushVec);    return;  }  const pose=poseAtDistance(r.progress,0);  const t=pose.tangent.clone();  const n=new THREE.Vector3(-t.z,0,t.x);  r.offset=THREE.MathUtils.clamp(r.offset + pushVec.dot(n), -trackData.width*.42, trackData.width*.42);  r.progress += pushVec.dot(t);  r.group.position.add(pushVec);}function applyCollisionImpulse(a,b,normal,severity){  const va=racerVelocity(a), vb=racerVelocity(b);  const rel=va.clone().sub(vb).dot(normal);  const closing=Math.max(0,-rel) + severity*.45;  const restitution=.38;  const invA=1/a.mass, invB=1/b.mass;  const impulse=(1+restitution)*closing/(invA+invB);  const impulseVec=normal.clone().multiplyScalar(impulse);  const deltaA=impulseVec.clone().multiplyScalar(invA);  const deltaB=impulseVec.clone().multiplyScalar(-invB);  a.hitVelocity.add(deltaA.multiplyScalar(.9));  b.hitVelocity.add(deltaB.multiplyScalar(.9));  a.speed += deltaA.dot(racerForward(a))*.72;  b.speed += deltaB.dot(racerForward(b))*.72;  const hitA=THREE.MathUtils.clamp(1 - severity*.009*(b.mass/a.mass),.42,.96);  const hitB=THREE.MathUtils.clamp(1 - severity*.009*(a.mass/b.mass),.42,.96);  a.speed*=hitA; b.speed*=hitB;  a.collisionSpin += THREE.MathUtils.clamp(deltaA.x - deltaA.z,-.9,.9)*.32;  b.collisionSpin += THREE.MathUtils.clamp(deltaB.z - deltaB.x,-.9,.9)*.32;  clampRacerSpeed(a); clampRacerSpeed(b);}function resolveCollisions(dt){  for(const [k,v] of collisionCooldowns){    const nv=v-dt;    if(nv<=0) collisionCooldowns.delete(k); else collisionCooldowns.set(k,nv);  }  for(let i=0;i<racers.length;i++){    for(let j=i+1;j<racers.length;j++){      const a=racers[i], b=racers[j];      if(a.finished || b.finished) continue;      const pa=a.group.position, pb=b.group.position;      const dx=pa.x-pb.x, dz=pa.z-pb.z;      const dist=Math.hypot(dx,dz);      const minDist=(a.radius||1.65)+(b.radius||1.65);      if(dist>=minDist) continue;      const normal = dist>0.0001 ? new THREE.Vector3(dx/dist,0,dz/dist) : racerForward(a);      const overlap=minDist-dist;      const invA=1/a.mass, invB=1/b.mass, invSum=invA+invB;      pushRacer(a, normal.clone().multiplyScalar(overlap*(invA/invSum)+.015));      pushRacer(b, normal.clone().multiplyScalar(-overlap*(invB/invSum)-.015));      const key=a.id<b.id ? `${a.id}-${b.id}` : `${b.id}-${a.id}`;      if(collisionCooldowns.has(key)) continue;      const severity=Math.max(4, racerVelocity(a).sub(racerVelocity(b)).length());      applyCollisionImpulse(a,b,normal,severity);      spawnSparks(pa.clone().add(pb).multiplyScalar(.5), severity); playCrashSound(severity); if(a.id==="player"||b.id==="player"){ player.damage=Math.min(100,(player.damage||0)+severity*.75); player.cleanLap=false; raceStats.crashes++; }      collisionCooldowns.set(key,.26);    }  }}function spawnSmoke(pos, forward, big=false){  if(!fxGroup) return;  const mat=new THREE.MeshBasicMaterial({color:0xb8bec8, transparent:true, opacity:big ? .55 : .34, depthWrite:false});  const puff=new THREE.Mesh(new THREE.SphereGeometry(big ? .42 : .26,8,6), mat);  puff.position.copy(pos).add(new THREE.Vector3((Math.random()-.5)*1.2,.18,(Math.random()-.5)*1.2));  puff.userData={life:big?1.0:.75, maxLife:big?1.0:.75, drift:new THREE.Vector3((Math.random()-.5)*1.2,.8,(Math.random()-.5)*1.2).addScaledVector(forward,-.35)};  fxGroup.add(puff); smokeParticles.push(puff);}function addSkidMark(pos,yaw){  if(!fxGroup || skidMarks.length>90) return;  const mat=new THREE.MeshBasicMaterial({color:0x050505, transparent:true, opacity:.36, depthWrite:false});  const mark=new THREE.Mesh(new THREE.PlaneGeometry(.28,2.2),mat);  mark.rotation.x=-Math.PI/2; mark.rotation.z=-yaw; mark.position.set(pos.x,.041,pos.z);  mark.userData={life:6.5,maxLife:6.5}; fxGroup.add(mark); skidMarks.push(mark);}function spawnSparks(pos,severity=10){  if(!fxGroup) return;  const count=Math.min(18,Math.floor(5+severity*.45));  const mat=new THREE.MeshBasicMaterial({color:0xffcc44});  for(let i=0;i<count;i++){    const sp=new THREE.Mesh(new THREE.SphereGeometry(.07,6,4),mat);    sp.position.copy(pos).add(new THREE.Vector3(0,.55,0));    sp.userData={life:.38+Math.random()*.35, maxLife:.7, vel:new THREE.Vector3((Math.random()-.5)*8,2+Math.random()*4,(Math.random()-.5)*8)};    fxGroup.add(sp); sparks.push(sp);  }}function spawnBoostBurst(pos){  for(let i=0;i<12;i++) spawnSmoke(pos, racerForward(player), true);}function updateEffects(dt){  for(let i=smokeParticles.length-1;i>=0;i--){ const p=smokeParticles[i]; p.userData.life-=dt; p.position.addScaledVector(p.userData.drift,dt); p.scale.multiplyScalar(1+dt*1.6); p.material.opacity=Math.max(0,.45*(p.userData.life/p.userData.maxLife)); if(p.userData.life<=0){fxGroup.remove(p); smokeParticles.splice(i,1);} }  for(let i=sparks.length-1;i>=0;i--){ const sp=sparks[i]; sp.userData.life-=dt; sp.userData.vel.y-=9.8*dt; sp.position.addScaledVector(sp.userData.vel,dt); sp.material.opacity=Math.max(0,sp.userData.life/sp.userData.maxLife); if(sp.userData.life<=0){fxGroup.remove(sp); sparks.splice(i,1);} }  for(let i=skidMarks.length-1;i>=0;i--){ const m=skidMarks[i]; m.userData.life-=dt; m.material.opacity=.36*Math.max(0,m.userData.life/m.userData.maxLife); if(m.userData.life<=0){fxGroup.remove(m); skidMarks.splice(i,1);} }}function handleTrackBarrier(r,info){  const limit=trackData.width*.50;  if(info.dist<limit) return;  const idx=info.index; const center=trackData.samples[idx]; const t=trackData.tangents[idx]; const n=new THREE.Vector3(-t.z,0,t.x);  const rel=new THREE.Vector3(r.group.position.x-center.x,0,r.group.position.z-center.z);  const side=Math.sign(rel.dot(n)) || 1;  const edge=center.clone().addScaledVector(n,side*(limit-.25)); edge.y=r.group.position.y;  r.group.position.lerp(edge,.45);  if(Math.abs(r.speed)>10){ spawnSparks(r.group.position, Math.abs(r.speed)); playCrashSound(Math.abs(r.speed)); if(r.id==="player"){ r.damage=Math.min(100,(r.damage||0)+Math.abs(r.speed)*.55); r.cleanLap=false; raceStats.crashes++; } }  r.speed*=-.18; r.collisionSpin+=side*.55;}function startAudio(){  try{    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();    audioCtx.resume?.();    if(!engineOsc){      engineOsc=audioCtx.createOscillator(); engineGain=audioCtx.createGain();      engineOsc.type="sawtooth"; engineOsc.frequency.value=70; engineGain.gain.value=.035;      engineOsc.connect(engineGain).connect(audioCtx.destination); engineOsc.start();    }  }catch(e){}}function stopEngineSound(){ if(engineGain) engineGain.gain.value=0; }function updateEngineSound(){  if(!audioCtx || !engineOsc || !engineGain || !player) return;  const sp=Math.min(1,Math.abs(player.speed)/Math.max(1,player.stats.maxSpeed));  engineGain.gain.value=raceStarted && !raceFinished ? (.025+sp*.055) : 0;  engineOsc.frequency.value=65+sp*155+(player.boostTime>0?80:0);}function playBoostSound(){  if(!audioCtx) return; const o=audioCtx.createOscillator(), g=audioCtx.createGain();  o.type="triangle"; o.frequency.setValueAtTime(220,audioCtx.currentTime); o.frequency.exponentialRampToValueAtTime(760,audioCtx.currentTime+.28);  g.gain.setValueAtTime(.18,audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.32); o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+.34);}function playCrashSound(severity=10){  if(!audioCtx) return; const o=audioCtx.createOscillator(), g=audioCtx.createGain();  o.type="square"; o.frequency.value=90+Math.random()*90; g.gain.value=Math.min(.16,.04+severity*.004);  g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.18); o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+.2);}function toggleMusic(){  startAudio(); if(!audioCtx) return; musicOn=!musicOn; $("musicBtn").textContent=musicOn?" Música":" Música";  if(musicOn){    if(!musicOsc1){ musicOsc1=audioCtx.createOscillator(); musicOsc2=audioCtx.createOscillator(); musicGain=audioCtx.createGain(); musicOsc1.type="sine"; musicOsc2.type="triangle"; musicOsc1.frequency.value=110; musicOsc2.frequency.value=220; musicGain.gain.value=.025; musicOsc1.connect(musicGain); musicOsc2.connect(musicGain); musicGain.connect(audioCtx.destination); musicOsc1.start(); musicOsc2.start(); }    musicGain.gain.value=.025;  }else if(musicGain){ musicGain.gain.value=0; }}function addLavaGlow(){  const lavaMat=new THREE.MeshBasicMaterial({color:0xff5a18, transparent:true, opacity:.72});  for(let i=0;i<16;i++){    const p=randomFarPoint(80,280);    const lava=new THREE.Mesh(new THREE.CircleGeometry(5+Math.random()*8,24),lavaMat);    lava.rotation.x=-Math.PI/2; lava.position.set(p.x,.055,p.z); scene.add(lava);    const light=new THREE.PointLight(0xff5a18,.6,42); light.position.set(p.x,3,p.z); scene.add(light);  }}function addReliefMountains(track){  const theme=track.theme;  const hillColor = theme==="desert" ? 0xb98245 : theme==="city" ? 0x172033 : theme==="alpine" ? 0x8aa0a8 : theme==="volcano" ? 0x4a1f1b : 0x2d7d31;  const mat=new THREE.MeshStandardMaterial({color:hillColor, roughness:1, metalness:0});  const snowMat=new THREE.MeshStandardMaterial({color:0xf2f7ff, roughness:.9});  const count = theme==="city" ? 14 : (theme==="volcano" ? 34 : 26);  for(let i=0;i<count;i++){    const angle=(i/count)*Math.PI*2 + Math.random()*.35;    const radius=150+Math.random()*170;    const x=Math.cos(angle)*radius;    const z=Math.sin(angle)*radius-110;    const h=(theme==="alpine"?16:theme==="desert"?10:7)+Math.random()*(theme==="alpine"?28:16);    const base=18+Math.random()*34;    const hill=new THREE.Mesh(new THREE.ConeGeometry(base,h,18),mat);    hill.position.set(x,h/2-1,z); hill.rotation.y=Math.random()*Math.PI; hill.castShadow=theme!=="city"; hill.receiveShadow=true; scene.add(hill);    if(theme==="alpine" && i%2===0){ const cap=new THREE.Mesh(new THREE.ConeGeometry(base*.42,h*.32,18),snowMat); cap.position.set(x,h*.85,z); scene.add(cap); }  }}function updateMinimap(){  const canvas=$("miniMap"); if(!canvas || canvas.style.display==="none" || !trackData) return;  const ctx=canvas.getContext("2d"), w=canvas.width, h=canvas.height;  ctx.clearRect(0,0,w,h); ctx.fillStyle="rgba(3,8,18,.78)"; ctx.fillRect(0,0,w,h);  let minX=Infinity,maxX=-Infinity,minZ=Infinity,maxZ=-Infinity;  for(const p of trackData.samples){ minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x); minZ=Math.min(minZ,p.z); maxZ=Math.max(maxZ,p.z); }  const pad=18, sx=(w-pad*2)/(maxX-minX||1), sz=(h-pad*2)/(maxZ-minZ||1), scale=Math.min(sx,sz);  const map=(v)=>({x:pad+(v.x-minX)*scale+(w-pad*2-(maxX-minX)*scale)/2, y:pad+(v.z-minZ)*scale+(h-pad*2-(maxZ-minZ)*scale)/2});  ctx.lineWidth=7; ctx.strokeStyle="rgba(255,255,255,.25)"; ctx.beginPath();  trackData.samples.forEach((p,i)=>{const m=map(p); if(i===0)ctx.moveTo(m.x,m.y); else ctx.lineTo(m.x,m.y);}); ctx.closePath(); ctx.stroke();  ctx.lineWidth=3; ctx.strokeStyle="rgba(0,229,255,.9)"; ctx.stroke();  for(const r of racers){ const m=map(r.group.position); ctx.beginPath(); ctx.arc(m.x,m.y,r.id==="player"?5:3,0,Math.PI*2); ctx.fillStyle=r.id==="player"?"#ffcc00":"#ff4d61"; ctx.fill(); }  ctx.fillStyle="rgba(255,255,255,.8)"; ctx.font="bold 11px system-ui"; ctx.fillText("MINIMAPA",10,14);}function updateChampionship(order){  const points=[10,7,5,3,2,1];  const champ=save.championship || clone(START_STATE).championship;  champ.points=champ.points || {player:0,Luna:0,Rayo:0,Nico:0,Vega:0,Max:0};  order.forEach((r,i)=>{ const key=r.id==="player"?"player":r.name; champ.points[key]=(champ.points[key]||0)+(points[i]||0); });  champ.races=(champ.races||0)+1; save.championship=champ;}function championshipHTML(){  const champ=save.championship || clone(START_STATE).championship;  const rows=Object.entries(champ.points||{}).sort((a,b)=>b[1]-a[1]);  return `<div class="recordBox"><b> Campeonato</b><br>Carreras: ${champ.races||0}<br>${rows.map(([n,p])=>`${n==="player"?"Tú":n}: ${p} pts`).join(" · ")}</div>`;}function missionHTML(playerPos){  const clean=raceStats.crashes===0;  const turbo=raceStats.turbos>=3;  const podium=playerPos<=3;  return `<div class="missionBox"><b> Misiones</b><br>${clean?"":""} Carrera limpia sin choques<br>${turbo?"":""} Usar turbo 3 veces<br>${raceStats.driftTime>=4?"":""} Derrapar 4 segundos<br>${raceStats.coinsFound>0?"":""} Recoger monedas/cajas (+${raceStats.coinsFound||0})<br>${(raceStats.jumps||0)>0?"":""} Hacer un salto gigante<br>${(raceStats.destruction||0)>=3?"":""} Romper 3 obstáculos<br>${podium?"":""} Terminar en podio</div>`;}initMenu();</script></body></html>
+}function animate(){  if(!renderer || !scene) return;  animationHandle=requestAnimationFrame(animate);  const dt=Math.min(clock.getDelta(),.045);  if(raceStarted && !raceFinished){ updateRace(dt); }  updateCamera(dt);  renderer.render(scene,camera);}function updateRace(dt){  updatePlayer(dt); updateAI(dt); resolveCollisions(dt); updateCollectibles(dt); updateEffects(dt); updateEngineSound(); updateHUD(); updateMinimap();  if(!freeDriveMode && (player.finished || racers.every(r=>r.finished))) finishRace();}function updatePlayer(dt){  const st=player.stats;  const boostActive = player.boostTime > 0;  const acc = (keys["w"]||keys["arrowup"]) ? st.acceleration * (boostActive ? 2.05 : 1) : 0;  const brake = (keys["s"]||keys["arrowdown"]) ? 1 : 0;  const hand = keys[" "] ? 1 : 0;  if(!player.finished){    if(acc) player.speed += acc*dt;    if(brake) player.speed -= (player.speed>0?st.acceleration*1.35:st.acceleration*.55)*dt;    const offroad = player.distanceFromCenter > trackData.width*.52;    const drag = offroad ? .935 : (hand ? .955 : .986);    player.speed *= Math.pow(drag, dt*60);    const damageFactor = THREE.MathUtils.clamp(1 - (player.damage||0)*.0035, .72, 1);    const currentMax = (boostActive ? st.maxSpeed*1.42 : st.maxSpeed) * damageFactor;    player.speed = THREE.MathUtils.clamp(player.speed, -st.maxSpeed*.35, currentMax);    const steer = (keys["a"]||keys["arrowleft"]?1:0) - (keys["d"]||keys["arrowright"]?1:0);    const steerPower = st.handling * (0.50 + Math.min(Math.abs(player.speed)/st.maxSpeed,1)*.95) * (player.speed>=0?1:-1);    player.yaw += steer * steerPower * dt * (hand?1.65:1.18);    player.yaw += player.collisionSpin * dt;    player.collisionSpin *= Math.pow(.72,dt*60);    player.group.rotation.y = player.yaw;    player.group.position.x -= Math.sin(player.yaw)*player.speed*dt;    player.group.position.z -= Math.cos(player.yaw)*player.speed*dt;    player.group.position.addScaledVector(player.hitVelocity,dt);    player.hitVelocity.multiplyScalar(Math.pow(.78,dt*60));    if(player.boostTime>0){      player.boostTime=Math.max(0,player.boostTime-dt);    }else{      const movingBonus = Math.min(Math.abs(player.speed)/Math.max(1,st.maxSpeed),1)*.035;      player.boostEnergy = Math.min(1, (player.boostEnergy ?? 1) + dt*(.075 + movingBonus));    }    setTurboFlames(player, boostActive);    const drifting = Math.abs(steer)>0 && Math.abs(player.speed)>18 && (hand || Math.abs(steerPower)>1.2);    if(drifting){ spawnSmoke(player.group.position, racerForward(player), false); addSkidMark(player.group.position, player.yaw); raceStats.driftTime+=dt; }    const info=distanceToTrack(player.group.position); player.distanceFromCenter=info.dist;    handleTrackBarrier(player, info);    const norm=info.along/trackData.totalLength;    if(norm<.15 && player.lastNorm>.85 && player.speed>3){      player.lap++;      const now=clock.getElapsedTime()-startTime;      const lapTime=now-(raceStats.lastLapTime||0);      raceStats.lastLapTime=now;      if(player.lap>0){ raceStats.lapTimes.push(lapTime); raceStats.bestLap = raceStats.bestLap==null ? lapTime : Math.min(raceStats.bestLap, lapTime); }    }    if(norm>.85 && player.lastNorm<.15 && player.speed<-5){ player.lap=Math.max(0,player.lap-1); }    player.lastNorm=norm; player.progress=player.lap*trackData.totalLength + info.along;    if(player.lap>=trackData.laps && !player.finished){ player.finished=true; player.finishTime=clock.getElapsedTime()-startTime; player.speed=0; }  }}function updateAI(dt){  const diff=parseFloat($("difficultySelect").value);  for(const ai of aiCars){    if(ai.finished) continue;    const turn = upcomingTurn(ai.progress);    const trackIndex = TRACK_ORDER.indexOf(selectedTrackId);    const lapPenalty = ai.lap===0 && selectedTrackId==="coast" ? .94 : 1;    const baseTarget = ai.stats.maxSpeed * diff * ai.skill * lapPenalty * (1 - Math.min(.60,turn*.86));    ai.speed += (baseTarget-ai.speed)*dt*(.34+ai.stats.acceleration/95);    ai.progress += ai.speed*dt;    ai.collisionSpin *= Math.pow(.78,dt*60);    const pose=poseAtDistance(ai.progress,ai.offset + Math.sin(ai.progress*.035+ai.skill*3)*.55);    ai.group.position.copy(pose.pos).addScaledVector(ai.hitVelocity,dt); ai.group.rotation.y=pose.yaw + ai.collisionSpin;    ai.hitVelocity.multiplyScalar(Math.pow(.80,dt*60));    ai.lap=Math.max(0,Math.floor(ai.progress/trackData.totalLength));    if(ai.progress >= trackData.totalLength*trackData.laps + 4 && !ai.finished){ ai.finished=true; ai.finishTime=clock.getElapsedTime()-startTime; }  }}function upcomingTurn(progress){  const a=poseAtDistance(progress,0).tangent; const b=poseAtDistance(progress+28,0).tangent;  return a.angleTo(b)/Math.PI;}function poseAtDistance(distance, offset=0){  const L=trackData.totalLength; let d=((distance%L)+L)%L;  let idx=0;  const arr=trackData.lengths;  let lo=0,hi=arr.length-1;  while(lo<=hi){ const mid=(lo+hi)>>1; if(arr[mid]<d){idx=mid; lo=mid+1;} else hi=mid-1; }  const p=trackData.samples[idx].clone(); const t=trackData.tangents[idx].clone(); const n=new THREE.Vector3(-t.z,0,t.x);  p.addScaledVector(n,offset); p.y=.45;  return {pos:p,tangent:t,yaw:Math.atan2(-t.x,-t.z)};}function distanceToTrack(pos){  let best=Infinity, bestIdx=0;  for(let i=0;i<trackData.samples.length;i+=3){    const p=trackData.samples[i]; const dx=pos.x-p.x, dz=pos.z-p.z; const ds=dx*dx+dz*dz;    if(ds<best){best=ds; bestIdx=i;}  }  return {dist:Math.sqrt(best), index:bestIdx, along:trackData.lengths[Math.min(bestIdx,trackData.lengths.length-1)]};}function getOrder(){  return [...racers].sort((a,b)=>{    if(a.finished && b.finished) return a.finishTime-b.finishTime;    if(a.finished) return -1;    if(b.finished) return 1;    return b.progress-a.progress;  });}function updateHUD(){  const order=getOrder(); const pos=order.findIndex(r=>r.id==="player")+1;  $("hudPosition").textContent=`${pos}/${racers.length}`;  $("hudLap").textContent=`${Math.min(player.lap+1,trackData.laps)}/${trackData.laps}`;  $("lapCornerText").textContent=`${Math.min(player.lap+1,trackData.laps)}/${trackData.laps}`;  if($("damageText")) $("damageText").textContent=`${Math.round(player.damage||0)}%`;  if($("bestLapText")) $("bestLapText").textContent=raceStats.bestLap?formatTime(raceStats.bestLap):(save.records?.[selectedTrackId]?formatTime(save.records[selectedTrackId]):"--");  if($("missionText")) $("missionText").textContent=(raceStats.crashes===0?"Vuelta limpia":"Evita choques") + (raceStats.turbos>=3?" + Turbo x3":"") + (raceStats.driftTime>=4?" + Drift":"") + ((raceStats.jumps||0)>0?" + Salto":"");  $("hudSpeed").textContent=Math.max(0,Math.round(Math.abs(player.speed)*5.4));  updateBoostUI();  let html=""; order.forEach((r,i)=>{ html+=`<div class="rankLine ${r.id==="player"?"me":""}"><span>${i+1}. ${r.name}</span><span>${r.finished?formatTime(r.finishTime):"v"+(Math.min(r.lap+1,trackData.laps))}</span></div>`; });  if(html!==lastRankHTML){ $("rankList").innerHTML=html; lastRankHTML=html; }}function cycleCamera(){  const modes=["follow","hood","top"];  cameraMode=modes[(modes.indexOf(cameraMode)+1)%modes.length];  if($("cameraModeSelect")) $("cameraModeSelect").value=cameraMode;}function updateCamera(dt){  if(!player?.group || !camera) return;  const carPos=player.group.position;  let target, look;  if(cameraMode==="hood"){    target=tmpVec.copy(carPos).add(new THREE.Vector3(-Math.sin(player.yaw)*1.2,1.55,-Math.cos(player.yaw)*1.2));    look=new THREE.Vector3(carPos.x-Math.sin(player.yaw)*18,carPos.y+1.1,carPos.z-Math.cos(player.yaw)*18);  }else if(cameraMode==="top"){    target=tmpVec.copy(carPos).add(new THREE.Vector3(0,28,0));    look=new THREE.Vector3(carPos.x,carPos.y,carPos.z);  }else{    const behind=new THREE.Vector3(Math.sin(player.yaw)*9,5.2,Math.cos(player.yaw)*9);    target=tmpVec.copy(carPos).add(behind); target.y+=1.8;    look=new THREE.Vector3(carPos.x,carPos.y+1.1,carPos.z);  }  camera.position.lerp(target,1-Math.pow(.001,dt));  camera.lookAt(look);}function formatTime(t){  if(t==null) return "--"; const m=Math.floor(t/60); const s=(t%60).toFixed(2).padStart(5,"0"); return `${m}:${s}`;}function finishRace(){  raceFinished=true; stopEngineSound(); $("boostButton").style.display="none"; $("quitRaceBtn").style.display="none"; $("cameraBtn").style.display="none"; $("musicBtn").style.display="none"; $("lapCorner").style.display="none"; $("miniMap").style.display="none"; $("raceExtra").style.display="none"; $("hud").style.display="none"; const order=getOrder(); const playerPos=order.findIndex(r=>r.id==="player")+1;  let reward = racePrize(playerPos, selectedTrackId);  const oldUnlocked=save.unlockedTracks.length;  if(player.finishTime && (!save.records[selectedTrackId] || player.finishTime < save.records[selectedTrackId])) save.records[selectedTrackId]=player.finishTime;  updateChampionship(order);  if(reward>0){ save.coins += reward; applyRaceBonuses(playerPos); }  if(playerPos===1){     unlockNextTrack();     if(selectedTrackId==="city" && !hasCar("legend1")){ save.ownedCars.push("legend1"); save.achievements.bossShadow=true; }    if(selectedTrackId==="volcano" && !hasCar("legend2")){ save.ownedCars.push("legend2"); save.achievements.champion=true; }  }  if(Object.values(save.achievements||{}).filter(Boolean).length>=6 && !hasCar("legend3")){ save.ownedCars.push("legend3"); toast(" Auto legendario desbloqueado: Crystal Phantom"); }  if(save.unlockedTracks.length===TRACK_ORDER.length) save.achievements.allTracks=true;  saveGame();  $("finishSubtitle").textContent = playerPos<=3 ? `Terminaste ${playerPos}.º y subiste en el campeonato.` : `Terminaste ${playerPos}.º. Necesitas podio para ganar monedas y 1.º lugar para desbloquear pistas.`;  let podium=`<div class="finishBanner"> Carrera terminada · Podio oficial</div><div class="podiumWrap">`;  const top3=order.slice(0,3);  const slots=[top3[1],top3[0],top3[2]];  const labels=[" 2.º"," 1.º"," 3.º"];  slots.forEach((r,i)=>{ if(!r) return; podium+=`<div class="podiumCard ${i===1?"first":""}"><div class="podiumRank">${labels[i]}</div><div class="podiumName">${r.name}</div><div class="podiumTime">${r.finished?formatTime(r.finishTime):"No terminó"}</div></div>`; });  podium+=`</div>`;  let table=podium+`<table class="results"><thead><tr><th>Puesto</th><th>Piloto</th><th>Tiempo</th><th>Auto</th></tr></thead><tbody>`;  order.forEach((r,i)=>{ const carName=CARS[r.carId]?.name || "IA"; table+=`<tr class="${r.id==="player"?"me":""}"><td>${i+1}</td><td>${r.name}</td><td>${r.finished ? formatTime(r.finishTime) : "No terminó"}</td><td>${carName}</td></tr>`; });  table+=`</tbody></table>`; $("resultsTable").innerHTML=table + `<div class="recordBox"><b> Récord de ${TRACKS[selectedTrackId].name}</b><br>Mejor tiempo guardado: ${save.records[selectedTrackId]?formatTime(save.records[selectedTrackId]):"--"}<br>Mejor vuelta de esta carrera: ${raceStats.bestLap?formatTime(raceStats.bestLap):"--"}</div>` + missionHTML(playerPos) + championshipHTML();  const pr = TRACK_REWARDS[selectedTrackId] || TRACK_REWARDS.coast;  $("rewardBox").textContent = reward>0 ? `Ganaste ${reward} monedas. Premios de esta pista: 1.º ${pr.first}, 2.º ${pr.second}, 3.º ${pr.third}. Total actual: ${save.coins} monedas. Saltos: ${raceStats.jumps||0}. Destrucción: ${raceStats.destruction||0}.` : `No ganaste monedas esta vez. Premios de esta pista: 1.º ${pr.first}, 2.º ${pr.second}, 3.º ${pr.third}. Total actual: ${save.coins} monedas. Saltos: ${raceStats.jumps||0}. Destrucción: ${raceStats.destruction||0}.`;  if(save.unlockedTracks.length>oldUnlocked){ const last=save.unlockedTracks[save.unlockedTracks.length-1]; $("unlockBox").style.display="block"; $("unlockBox").textContent=`Ganaste la carrera. Nueva pista desbloqueada: ${TRACKS[last].name}.`; } else { $("unlockBox").style.display="none"; }  $("coinTextEnd").textContent=save.coins; $("finishModal").style.display="flex"; launchConfetti();}function launchConfetti(){  const old=document.querySelectorAll('.confettiBit'); old.forEach(x=>x.remove());  for(let i=0;i<70;i++){    const d=document.createElement('div'); d.className='confettiBit';    d.style.position='fixed'; d.style.left=(Math.random()*100)+'vw'; d.style.top='-20px'; d.style.width='8px'; d.style.height='14px'; d.style.borderRadius='3px'; d.style.zIndex='50'; d.style.background=['#ffcc00','#00e5ff','#ff4d61','#52ff9a','#ffffff'][i%5]; d.style.pointerEvents='none';    d.style.transform=`rotate(${Math.random()*360}deg)`; d.style.transition=`transform ${1.8+Math.random()*1.4}s linear, top ${1.8+Math.random()*1.4}s ease-in`;    document.body.appendChild(d);    requestAnimationFrame(()=>{ d.style.top='105vh'; d.style.transform=`translateX(${(Math.random()-.5)*200}px) rotate(${Math.random()*900}deg)`; });    setTimeout(()=>d.remove(),3600);  }}function applyRaceBonuses(playerPos){  save.achievements=save.achievements||{};  if(playerPos===1) save.achievements.firstWin=true;  if(raceStats.crashes===0) save.achievements.cleanRace=true;  if(raceStats.turbos>=3) save.achievements.turboMaster=true;  if((save.discovered?.boxes||0)>=5) save.achievements.collector=true;  if(selectedTrackId==="volcano" && playerPos===1) save.achievements.champion=true;  if(save.unlockedTracks.length>=TRACK_ORDER.length) save.achievements.allTracks=true;  const missionBonus=(raceStats.crashes===0?45:0)+(raceStats.turbos>=3?55:0)+(raceStats.driftTime>=4?60:0);  if(missionBonus>0) save.coins+=missionBonus;}function unlockNextTrack(){  for(const id of TRACK_ORDER){ if(!save.unlockedTracks.includes(id)){ save.unlockedTracks.push(id); return; } }}function activateBoost(){  if(!raceStarted || raceFinished || !player || player.finished) return;  if((player.boostEnergy ?? 0) < 1 || player.boostTime>0) return;  player.boostEnergy = 0;  player.boostTime=2.35;  raceStats.turbos++;  player.speed=Math.max(player.speed, player.stats.maxSpeed*.55);  player.hitVelocity.add(racerForward(player).multiplyScalar(13));  spawnBoostBurst(player.group.position); playBoostSound();  updateBoostUI();}function updateBoostUI(){  if(!player) return;  const energy = THREE.MathUtils.clamp(player.boostEnergy ?? 0,0,1);  const percent = Math.round(energy*100);  const ready = energy >= 1 && player.boostTime<=0 && raceStarted && !raceFinished && !player.finished;  $("hudTurbo").textContent = player.boostTime>0 ? "ACTIVO" : `${percent}%`;  $("turboFill").style.width = `${percent}%`;  $("turboLabel").textContent = player.boostTime>0 ? " TURBO ACTIVADO" : (ready ? " TURBO LISTO" : ` CARGANDO ${percent}%`);  const btn=$("boostButton");  btn.disabled = !ready;  btn.classList.toggle("active", player.boostTime>0);  btn.classList.toggle("ready", ready);  document.querySelectorAll('[data-action="boost"]').forEach(b=>b.classList.toggle("ready", ready));  setTurboFlames(player, player.boostTime>0);}function setTurboFlames(racer,on){  const flames=racer?.group?.userData?.turboFlames || [];  for(const f of flames){ f.visible=!!on; if(on){ const s=.75+Math.random()*.6; f.scale.set(s,s,s); }}}function carMass(id){  if(["monster","truck","pickup","suv","police2"].includes(id)) return 1850;  if(["muscle","drag","classic1","classic2"].includes(id)) return 1420;  if(["rally","rally2","snow","beach"].includes(id)) return 1280;  if(["formula","formula2","prototype","proto2","hyper","hyper2","hyper3","moon","void"].includes(id)) return 1080;  return 1210;}function racerForward(r){  return new THREE.Vector3(-Math.sin(r.yaw ?? r.group.rotation.y),0,-Math.cos(r.yaw ?? r.group.rotation.y)).normalize();}function racerVelocity(r){  const forward=racerForward(r);  return forward.multiplyScalar(r.speed || 0).add(r.hitVelocity || new THREE.Vector3());}function clampRacerSpeed(r){  const max=r.id==="player" && r.boostTime>0 ? r.stats.maxSpeed*1.42 : r.stats.maxSpeed;  r.speed=THREE.MathUtils.clamp(r.speed,-r.stats.maxSpeed*.35,max);}function pushRacer(r,pushVec){  if(r.id==="player"){    r.group.position.add(pushVec);    return;  }  const pose=poseAtDistance(r.progress,0);  const t=pose.tangent.clone();  const n=new THREE.Vector3(-t.z,0,t.x);  r.offset=THREE.MathUtils.clamp(r.offset + pushVec.dot(n), -trackData.width*.42, trackData.width*.42);  r.progress += pushVec.dot(t);  r.group.position.add(pushVec);}function applyCollisionImpulse(a,b,normal,severity){  const va=racerVelocity(a), vb=racerVelocity(b);  const rel=va.clone().sub(vb).dot(normal);  const closing=Math.max(0,-rel) + severity*.45;  const restitution=.38;  const invA=1/a.mass, invB=1/b.mass;  const impulse=(1+restitution)*closing/(invA+invB);  const impulseVec=normal.clone().multiplyScalar(impulse);  const deltaA=impulseVec.clone().multiplyScalar(invA);  const deltaB=impulseVec.clone().multiplyScalar(-invB);  a.hitVelocity.add(deltaA.multiplyScalar(.9));  b.hitVelocity.add(deltaB.multiplyScalar(.9));  a.speed += deltaA.dot(racerForward(a))*.72;  b.speed += deltaB.dot(racerForward(b))*.72;  const hitA=THREE.MathUtils.clamp(1 - severity*.009*(b.mass/a.mass),.42,.96);  const hitB=THREE.MathUtils.clamp(1 - severity*.009*(a.mass/b.mass),.42,.96);  a.speed*=hitA; b.speed*=hitB;  a.collisionSpin += THREE.MathUtils.clamp(deltaA.x - deltaA.z,-.9,.9)*.32;  b.collisionSpin += THREE.MathUtils.clamp(deltaB.z - deltaB.x,-.9,.9)*.32;  clampRacerSpeed(a); clampRacerSpeed(b);}function resolveCollisions(dt){  for(const [k,v] of collisionCooldowns){    const nv=v-dt;    if(nv<=0) collisionCooldowns.delete(k); else collisionCooldowns.set(k,nv);  }  for(let i=0;i<racers.length;i++){    for(let j=i+1;j<racers.length;j++){      const a=racers[i], b=racers[j];      if(a.finished || b.finished) continue;      const pa=a.group.position, pb=b.group.position;      const dx=pa.x-pb.x, dz=pa.z-pb.z;      const dist=Math.hypot(dx,dz);      const minDist=(a.radius||1.65)+(b.radius||1.65);      if(dist>=minDist) continue;      const normal = dist>0.0001 ? new THREE.Vector3(dx/dist,0,dz/dist) : racerForward(a);      const overlap=minDist-dist;      const invA=1/a.mass, invB=1/b.mass, invSum=invA+invB;      pushRacer(a, normal.clone().multiplyScalar(overlap*(invA/invSum)+.015));      pushRacer(b, normal.clone().multiplyScalar(-overlap*(invB/invSum)-.015));      const key=a.id<b.id ? `${a.id}-${b.id}` : `${b.id}-${a.id}`;      if(collisionCooldowns.has(key)) continue;      const severity=Math.max(4, racerVelocity(a).sub(racerVelocity(b)).length());      applyCollisionImpulse(a,b,normal,severity);      spawnSparks(pa.clone().add(pb).multiplyScalar(.5), severity); playCrashSound(severity); if(a.id==="player"||b.id==="player"){ player.damage=Math.min(100,(player.damage||0)+severity*.75); player.cleanLap=false; raceStats.crashes++; }      collisionCooldowns.set(key,.26);    }  }}function spawnSmoke(pos, forward, big=false){  if(!fxGroup) return;  const mat=new THREE.MeshBasicMaterial({color:0xb8bec8, transparent:true, opacity:big ? .55 : .34, depthWrite:false});  const puff=new THREE.Mesh(new THREE.SphereGeometry(big ? .42 : .26,8,6), mat);  puff.position.copy(pos).add(new THREE.Vector3((Math.random()-.5)*1.2,.18,(Math.random()-.5)*1.2));  puff.userData={life:big?1.0:.75, maxLife:big?1.0:.75, drift:new THREE.Vector3((Math.random()-.5)*1.2,.8,(Math.random()-.5)*1.2).addScaledVector(forward,-.35)};  fxGroup.add(puff); smokeParticles.push(puff);}function addSkidMark(pos,yaw){  if(!fxGroup || skidMarks.length>90) return;  const mat=new THREE.MeshBasicMaterial({color:0x050505, transparent:true, opacity:.36, depthWrite:false});  const mark=new THREE.Mesh(new THREE.PlaneGeometry(.28,2.2),mat);  mark.rotation.x=-Math.PI/2; mark.rotation.z=-yaw; mark.position.set(pos.x,.041,pos.z);  mark.userData={life:6.5,maxLife:6.5}; fxGroup.add(mark); skidMarks.push(mark);}function spawnSparks(pos,severity=10){  if(!fxGroup) return;  const count=Math.min(18,Math.floor(5+severity*.45));  const mat=new THREE.MeshBasicMaterial({color:0xffcc44});  for(let i=0;i<count;i++){    const sp=new THREE.Mesh(new THREE.SphereGeometry(.07,6,4),mat);    sp.position.copy(pos).add(new THREE.Vector3(0,.55,0));    sp.userData={life:.38+Math.random()*.35, maxLife:.7, vel:new THREE.Vector3((Math.random()-.5)*8,2+Math.random()*4,(Math.random()-.5)*8)};    fxGroup.add(sp); sparks.push(sp);  }}function spawnBoostBurst(pos){  for(let i=0;i<12;i++) spawnSmoke(pos, racerForward(player), true);}function updateEffects(dt){  for(let i=smokeParticles.length-1;i>=0;i--){ const p=smokeParticles[i]; p.userData.life-=dt; p.position.addScaledVector(p.userData.drift,dt); p.scale.multiplyScalar(1+dt*1.6); p.material.opacity=Math.max(0,.45*(p.userData.life/p.userData.maxLife)); if(p.userData.life<=0){fxGroup.remove(p); smokeParticles.splice(i,1);} }  for(let i=sparks.length-1;i>=0;i--){ const sp=sparks[i]; sp.userData.life-=dt; sp.userData.vel.y-=9.8*dt; sp.position.addScaledVector(sp.userData.vel,dt); sp.material.opacity=Math.max(0,sp.userData.life/sp.userData.maxLife); if(sp.userData.life<=0){fxGroup.remove(sp); sparks.splice(i,1);} }  for(let i=skidMarks.length-1;i>=0;i--){ const m=skidMarks[i]; m.userData.life-=dt; m.material.opacity=.36*Math.max(0,m.userData.life/m.userData.maxLife); if(m.userData.life<=0){fxGroup.remove(m); skidMarks.splice(i,1);} }}function handleTrackBarrier(r,info){  const limit=trackData.width*.50;  if(info.dist<limit) return;  const idx=info.index; const center=trackData.samples[idx]; const t=trackData.tangents[idx]; const n=new THREE.Vector3(-t.z,0,t.x);  const rel=new THREE.Vector3(r.group.position.x-center.x,0,r.group.position.z-center.z);  const side=Math.sign(rel.dot(n)) || 1;  const edge=center.clone().addScaledVector(n,side*(limit-.25)); edge.y=r.group.position.y;  r.group.position.lerp(edge,.45);  if(Math.abs(r.speed)>10){ spawnSparks(r.group.position, Math.abs(r.speed)); playCrashSound(Math.abs(r.speed)); if(r.id==="player"){ r.damage=Math.min(100,(r.damage||0)+Math.abs(r.speed)*.55); r.cleanLap=false; raceStats.crashes++; } }  r.speed*=-.18; r.collisionSpin+=side*.55;}function startAudio(){  try{    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();    audioCtx.resume?.();    if(!engineOsc){      engineOsc=audioCtx.createOscillator(); engineGain=audioCtx.createGain();      engineOsc.type="sawtooth"; engineOsc.frequency.value=70; engineGain.gain.value=.035;      engineOsc.connect(engineGain).connect(audioCtx.destination); engineOsc.start();    }  }catch(e){}}function stopEngineSound(){ if(engineGain) engineGain.gain.value=0; }function updateEngineSound(){  if(!audioCtx || !engineOsc || !engineGain || !player) return;  const sp=Math.min(1,Math.abs(player.speed)/Math.max(1,player.stats.maxSpeed));  engineGain.gain.value=raceStarted && !raceFinished ? (.025+sp*.055) : 0;  engineOsc.frequency.value=65+sp*155+(player.boostTime>0?80:0);}function playBoostSound(){  if(!audioCtx) return; const o=audioCtx.createOscillator(), g=audioCtx.createGain();  o.type="triangle"; o.frequency.setValueAtTime(220,audioCtx.currentTime); o.frequency.exponentialRampToValueAtTime(760,audioCtx.currentTime+.28);  g.gain.setValueAtTime(.18,audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.32); o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+.34);}function playCrashSound(severity=10){  if(!audioCtx) return; const o=audioCtx.createOscillator(), g=audioCtx.createGain();  o.type="square"; o.frequency.value=90+Math.random()*90; g.gain.value=Math.min(.16,.04+severity*.004);  g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.18); o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+.2);}function toggleMusic(){  startAudio(); if(!audioCtx) return; musicOn=!musicOn; $("musicBtn").textContent=musicOn?" Música":" Música";  if(musicOn){    if(!musicOsc1){ musicOsc1=audioCtx.createOscillator(); musicOsc2=audioCtx.createOscillator(); musicGain=audioCtx.createGain(); musicOsc1.type="sine"; musicOsc2.type="triangle"; musicOsc1.frequency.value=110; musicOsc2.frequency.value=220; musicGain.gain.value=.025; musicOsc1.connect(musicGain); musicOsc2.connect(musicGain); musicGain.connect(audioCtx.destination); musicOsc1.start(); musicOsc2.start(); }    musicGain.gain.value=.025;  }else if(musicGain){ musicGain.gain.value=0; }}function addLavaGlow(){  const lavaMat=new THREE.MeshBasicMaterial({color:0xff5a18, transparent:true, opacity:.72});  for(let i=0;i<16;i++){    const p=randomFarPoint(80,280);    const lava=new THREE.Mesh(new THREE.CircleGeometry(5+Math.random()*8,24),lavaMat);    lava.rotation.x=-Math.PI/2; lava.position.set(p.x,.055,p.z); scene.add(lava);    const light=new THREE.PointLight(0xff5a18,.6,42); light.position.set(p.x,3,p.z); scene.add(light);  }}function addReliefMountains(track){  const theme=track.theme;  const hillColor = theme==="desert" ? 0xb98245 : theme==="city" ? 0x172033 : theme==="alpine" ? 0x8aa0a8 : theme==="volcano" ? 0x4a1f1b : 0x2d7d31;  const mat=new THREE.MeshStandardMaterial({color:hillColor, roughness:1, metalness:0});  const snowMat=new THREE.MeshStandardMaterial({color:0xf2f7ff, roughness:.9});  const count = theme==="city" ? 14 : (theme==="volcano" ? 34 : 26);  for(let i=0;i<count;i++){    const angle=(i/count)*Math.PI*2 + Math.random()*.35;    const radius=150+Math.random()*170;    const x=Math.cos(angle)*radius;    const z=Math.sin(angle)*radius-110;    const h=(theme==="alpine"?16:theme==="desert"?10:7)+Math.random()*(theme==="alpine"?28:16);    const base=18+Math.random()*34;    const hill=new THREE.Mesh(new THREE.ConeGeometry(base,h,18),mat);    hill.position.set(x,h/2-1,z); hill.rotation.y=Math.random()*Math.PI; hill.castShadow=theme!=="city"; hill.receiveShadow=true; scene.add(hill);    if(theme==="alpine" && i%2===0){ const cap=new THREE.Mesh(new THREE.ConeGeometry(base*.42,h*.32,18),snowMat); cap.position.set(x,h*.85,z); scene.add(cap); }  }}function updateMinimap(){  const canvas=$("miniMap"); if(!canvas || canvas.style.display==="none" || !trackData) return;  const ctx=canvas.getContext("2d"), w=canvas.width, h=canvas.height;  ctx.clearRect(0,0,w,h); ctx.fillStyle="rgba(3,8,18,.78)"; ctx.fillRect(0,0,w,h);  let minX=Infinity,maxX=-Infinity,minZ=Infinity,maxZ=-Infinity;  for(const p of trackData.samples){ minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x); minZ=Math.min(minZ,p.z); maxZ=Math.max(maxZ,p.z); }  const pad=18, sx=(w-pad*2)/(maxX-minX||1), sz=(h-pad*2)/(maxZ-minZ||1), scale=Math.min(sx,sz);  const map=(v)=>({x:pad+(v.x-minX)*scale+(w-pad*2-(maxX-minX)*scale)/2, y:pad+(v.z-minZ)*scale+(h-pad*2-(maxZ-minZ)*scale)/2});  ctx.lineWidth=7; ctx.strokeStyle="rgba(255,255,255,.25)"; ctx.beginPath();  trackData.samples.forEach((p,i)=>{const m=map(p); if(i===0)ctx.moveTo(m.x,m.y); else ctx.lineTo(m.x,m.y);}); ctx.closePath(); ctx.stroke();  ctx.lineWidth=3; ctx.strokeStyle="rgba(0,229,255,.9)"; ctx.stroke();  for(const r of racers){ const m=map(r.group.position); ctx.beginPath(); ctx.arc(m.x,m.y,r.id==="player"?5:3,0,Math.PI*2); ctx.fillStyle=r.id==="player"?"#ffcc00":"#ff4d61"; ctx.fill(); }  ctx.fillStyle="rgba(255,255,255,.8)"; ctx.font="bold 11px system-ui"; ctx.fillText("MINIMAPA",10,14);}function updateChampionship(order){  const points=[10,7,5,3,2,1];  const champ=save.championship || clone(START_STATE).championship;  champ.points=champ.points || {player:0,Luna:0,Rayo:0,Nico:0,Vega:0,Max:0};  order.forEach((r,i)=>{ const key=r.id==="player"?"player":r.name; champ.points[key]=(champ.points[key]||0)+(points[i]||0); });  champ.races=(champ.races||0)+1; save.championship=champ;}function championshipHTML(){  const champ=save.championship || clone(START_STATE).championship;  const rows=Object.entries(champ.points||{}).sort((a,b)=>b[1]-a[1]);  return `<div class="recordBox"><b> Campeonato</b><br>Carreras: ${champ.races||0}<br>${rows.map(([n,p])=>`${n==="player"?"Tú":n}: ${p} pts`).join(" · ")}</div>`;}function missionHTML(playerPos){  const clean=raceStats.crashes===0;  const turbo=raceStats.turbos>=3;  const podium=playerPos<=3;  return `<div class="missionBox"><b> Misiones</b><br>${clean?"":""} Carrera limpia sin choques<br>${turbo?"":""} Usar turbo 3 veces<br>${raceStats.driftTime>=4?"":""} Derrapar 4 segundos<br>${raceStats.coinsFound>0?"":""} Recoger monedas/cajas (+${raceStats.coinsFound||0})<br>${(raceStats.jumps||0)>0?"":""} Hacer un salto gigante<br>${(raceStats.destruction||0)>=3?"":""} Romper 3 obstáculos<br>${podium?"":""} Terminar en podio</div>`;}
+// RACING_LEGENDS_3D_ACTUALIZACION_V2
+/* Racing Legends 3D - actualización integrada en el mismo módulo de Three.js.
+   Añadir este código justo ANTES de la última llamada initMenu().
+   No ejecutar como <script> separado: el juego usa variables con alcance de módulo. */
+
+// Los STL se habían volteado 180° después de normalizar sus ejes.
+// Su orientación natural, con estos cinco STL concretos, es la contraria.
+for (const id of CAR_ORDER) CARS[id].frontFlip = false;
+
+const UPGRADE_MATERIALS = {
+  rubber: new THREE.MeshStandardMaterial({ color: 0x101216, roughness: .97 }),
+  hub: new THREE.MeshStandardMaterial({ color: 0xc3cbd5, metalness: .85, roughness: .22 }),
+  darkMetal: new THREE.MeshStandardMaterial({ color: 0x171f2a, metalness: .66, roughness: .34 }),
+  glass: new THREE.MeshPhysicalMaterial({ color: 0x1b4153, transparent: true, opacity: .82, metalness: .26, roughness: .13, clearcoat: 1, side: THREE.DoubleSide, depthWrite: false }),
+  headlights: new THREE.MeshStandardMaterial({ color: 0xeaf8ff, emissive: 0xc6f0ff, emissiveIntensity: 1.0, roughness: .15 }),
+  taillights: new THREE.MeshStandardMaterial({ color: 0xa90019, emissive: 0xff1627, emissiveIntensity: .75 }),
+  indicators: new THREE.MeshStandardMaterial({ color: 0xffb62e, emissive: 0xbb5700, emissiveIntensity: .25 })
+};
+const upgradedCreateCarModel = createCarModel;
+createCarModel = function(colorHex, carId='comet', isPlayer=false, paintStyle='clean') {
+  const group=upgradedCreateCarModel(colorHex,carId,isPlayer,paintStyle);
+  const geometry=CAR_GEOMETRY_CACHE.get(carId);
+  const dims=geometry?.userData.carDimensions || {width:1.9,height:1.35,length:4.0};
+  const w=Math.max(1.4,dims.width), l=Math.max(3.5,dims.length), h=Math.max(.75,dims.height);
+  const rw=THREE.MathUtils.clamp(w*.215,.32,.47);
+  const wheelX=w*.48+.06, wheelY=Math.max(rw*.90,Math.min(.53,h*.29));
+  const frontZ=-l*.30, rearZ=l*.30;
+  const wheels=[];
+  const tireGeometry=new THREE.CylinderGeometry(rw,rw,.29,24);
+  tireGeometry.rotateZ(Math.PI/2);  // neumático gira alrededor del eje X
+  const hubGeometry=new THREE.CylinderGeometry(rw*.58,rw*.58,.315,18);
+  hubGeometry.rotateZ(Math.PI/2);
+  const axleGeometry=new THREE.CylinderGeometry(rw*.19,rw*.19,.34,12);
+  axleGeometry.rotateZ(Math.PI/2);
+  for(const front of [true,false]) for(const side of [-1,1]){
+    const pivot=new THREE.Group();
+    pivot.position.set(side*wheelX,wheelY,front?frontZ:rearZ);
+    const rotating=new THREE.Group();
+    const tire=new THREE.Mesh(tireGeometry,UPGRADE_MATERIALS.rubber);
+    const hub=new THREE.Mesh(hubGeometry,UPGRADE_MATERIALS.hub);
+    const axle=new THREE.Mesh(axleGeometry,UPGRADE_MATERIALS.darkMetal);
+    tire.castShadow=true;
+    rotating.add(tire,hub,axle);
+    // Cinco radios brillantes permiten ver el giro de la rueda.
+    for(let s=0;s<5;s++){
+      const spoke=new THREE.Mesh(new THREE.BoxGeometry(.015,rw*.46,.065),UPGRADE_MATERIALS.darkMetal);
+      spoke.position.set(side*.168,Math.cos(s*Math.PI*2/5)*rw*.32,Math.sin(s*Math.PI*2/5)*rw*.32);
+      spoke.rotation.x=s*Math.PI*2/5;
+      rotating.add(spoke);
+    }
+    pivot.add(rotating);group.add(pivot);wheels.push({pivot,rotating,front});
+  }
+  // Piezas claramente diferenciadas: carrocería, cristales, parrilla,
+  // faros, intermitentes, pilotos posteriores y salidas de escape.
+  const addPart=(geo,mat,pos)=>{
+    const mesh=new THREE.Mesh(geo,mat);mesh.position.set(...pos);group.add(mesh);return mesh;
+  };
+  const headY=Math.max(.37,Math.min(h*.40,.78));
+  const lampW=Math.max(.20,w*.22);
+  for(const side of [-1,1]){
+    addPart(new THREE.BoxGeometry(lampW,.13,.09),UPGRADE_MATERIALS.headlights,
+      [side*w*.32,headY,-l*.505]);
+    addPart(new THREE.BoxGeometry(lampW*.93,.13,.10),UPGRADE_MATERIALS.taillights,
+      [side*w*.32,headY,l*.505]);
+    addPart(new THREE.BoxGeometry(.10,.095,.11),UPGRADE_MATERIALS.indicators,
+      [side*w*.475,headY,-l*.50]);
+    addPart(new THREE.CylinderGeometry(.075,.075,.17,10),UPGRADE_MATERIALS.darkMetal,
+      [side*w*.21,.28,l*.52]).rotation.x=Math.PI/2;
+  }
+  addPart(new THREE.BoxGeometry(w*.44,.18,.09),UPGRADE_MATERIALS.darkMetal,[0,headY-.17,-l*.505]);
+  // Ventanas superpuestas: superficies finas, no bloques opacos que tapen el STL.
+  // Los laterales y lunas contrastan con el color seleccionado en el garaje.
+  const glassHeight=Math.max(.24,Math.min(h*.24,.49));
+  const cabinY=Math.max(.72,Math.min(h*.73,1.23));
+  const roofFront=-l*.105,roofRear=l*.145;
+  for(const side of [-1,1]){
+    const glass=addPart(new THREE.PlaneGeometry(l*.235,glassHeight),UPGRADE_MATERIALS.glass,
+      [side*w*.375,cabinY,0]);
+    glass.rotation.y=Math.PI/2;
+  }
+  const windshield=addPart(new THREE.PlaneGeometry(w*.63,glassHeight),UPGRADE_MATERIALS.glass,
+    [0,cabinY,roofFront]);
+  windshield.rotation.x=-.38;
+  const backglass=addPart(new THREE.PlaneGeometry(w*.63,glassHeight*.85),UPGRADE_MATERIALS.glass,
+    [0,cabinY,roofRear]);
+  backglass.rotation.x=.35;
+  group.userData.upgradeWheels=wheels;
+  group.userData.wheelRadius=rw;
+  return group;
+};
+
+
+// Los materiales de vidrio/neumático/metal son compartidos. Evitamos que el
+// selector de garaje los destruya al cambiar de auto o pintura.
+updateGaragePreview=function(){
+  if(!garageScene)return;
+  if(garageCar){
+    garageScene.remove(garageCar);
+    const disposed=new Set();
+    garageCar.traverse(o=>{
+      if(o.geometry && !o.userData?.sharedCarGeometry && !disposed.has(o.geometry)){
+        disposed.add(o.geometry);o.geometry.dispose?.();
+      }
+      if(o.material && !Object.values(UPGRADE_MATERIALS).includes(o.material))
+        o.material.dispose?.();
+    });
+  }
+  garageCar=createCarModel(selectedColor,selectedCarId,true,selectedPaintStyle);
+  garageCar.position.set(0,-.35,0);
+  garageScene.add(garageCar);
+};
+
+// Marca de carril, bordes y quitamiedos de ambos lados: un trazado continuo.
+// Sustituye los pequeños bloques flotantes, pero conserva la línea de salida.
+addRoadDetails = function(samples,tangents,leftBar,rightBar,track){
+  const edgeMat=new THREE.MeshStandardMaterial({color:0xf4e5bd,roughness:.9});
+  const centerMat=new THREE.MeshStandardMaterial({color:0xf7df86,roughness:.9});
+  const poleMat=new THREE.MeshStandardMaterial({color:0x66727b,metalness:.65,roughness:.43});
+  for(const side of [leftBar,rightBar]){
+    const vertices=[],colors=[],indices=[];
+    for(let i=0;i<side.length;i++){
+      const p=side[i], stripe=Math.floor(i/22)%2;
+      const c=new THREE.Color(stripe?0xd82336:0xf4f4eb);
+      // Muro continuo elevado y sin huecos, visible incluso en curvas.
+      vertices.push(p.x,.12,p.z,p.x,1.13,p.z);
+      for(let j=0;j<2;j++)colors.push(c.r,c.g,c.b);
+      if(i>0){let a=2*(i-1),b=a+1,d=a+2,e=a+3;
+        indices.push(a,b,d,b,e,d,a,d,b,b,d,e);}
+    }
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.Float32BufferAttribute(vertices,3));
+    g.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));
+    g.setIndex(indices);g.computeVertexNormals();
+    const mesh=new THREE.Mesh(g,new THREE.MeshStandardMaterial({vertexColors:true,roughness:.71,side:THREE.DoubleSide}));
+    mesh.receiveShadow=true;scene.add(mesh);
+    for(let i=0;i<side.length;i+=25){
+      const p=side[i];
+      const post=new THREE.Mesh(new THREE.BoxGeometry(.22,1.33,.22),poleMat);
+      post.position.set(p.x,.66,p.z);scene.add(post);
+    }
+  }
+  for(let i=0;i<samples.length-5;i+=13){
+    const p=samples[i],t=tangents[i],normal=new THREE.Vector3(-t.z,0,t.x);
+    const dash=new THREE.Mesh(new THREE.BoxGeometry(.25,.036,3.5),centerMat);
+    dash.position.set(p.x,.086,p.z);dash.rotation.y=Math.atan2(-t.x,-t.z);scene.add(dash);
+    for(const s of [-1,1]){
+      const mark=new THREE.Mesh(new THREE.BoxGeometry(.16,.035,7),edgeMat);
+      mark.position.copy(p).addScaledVector(normal,s*(track.width*.5-.50));mark.y=.082;
+      mark.rotation.y=Math.atan2(-t.x,-t.z);scene.add(mark);
+    }
+  }
+  const start=samples[0],n=new THREE.Vector3(-tangents[0].z,0,tangents[0].x);
+  for(let k=-Math.floor(track.width/2);k<track.width/2;k++){
+    const tile=new THREE.Mesh(new THREE.BoxGeometry(1,.06,1),
+      new THREE.MeshStandardMaterial({color:k%2?0x171a1f:0xffffff}));
+    tile.position.copy(start).addScaledVector(n,k+.5);tile.position.y=.092;
+    scene.add(tile);
+  }
+};
+
+// Rampa REAL: cuña de subida en el sentido -Z del coche, alineada con la pista.
+function upgradeRampGeometry(width,length,height){
+  const x=width/2,z=length/2;
+  const p=[-x,.07,z, x,.07,z, -x,height,-z, x,height,-z,
+           -x,.07,-z,x,.07,-z];
+  // Dos triángulos de superficie y paredes cerradas.
+  const ii=[0,1,2,1,3,2, 0,2,4, 1,5,3, 2,3,4,3,5,4, 0,4,5,0,5,1];
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(p,3));g.setIndex(ii);g.computeVertexNormals();
+  return g;
+}
+addEpicSetPieces = function(track,samples,tangents){
+  epicZones=[];
+  const rampMaterial=new THREE.MeshStandardMaterial({color:0xe0a51b,metalness:.52,roughness:.51,side:THREE.DoubleSide});
+  const stripeMaterial=new THREE.MeshStandardMaterial({color:0x131a24,roughness:.75});
+  const sizeW=Math.min(track.width*.55,12),sizeL=8.0;
+  [.19,.45,.73].forEach((norm,index)=>{
+    const i=Math.floor(norm*(samples.length-1));
+    const p=samples[i].clone(),t=tangents[i];
+    const ramp=new THREE.Group();ramp.position.copy(p);ramp.rotation.y=Math.atan2(-t.x,-t.z);
+    const wedge=new THREE.Mesh(upgradeRampGeometry(sizeW,sizeL,1.34),rampMaterial);
+    wedge.receiveShadow=true;wedge.castShadow=true;ramp.add(wedge);
+    for(let k=0;k<5;k++){
+      const line=new THREE.Mesh(new THREE.BoxGeometry(sizeW*.9,.025,.23),stripeMaterial);
+      line.position.set(0,.18+k*.23,sizeL/2-1-k*1.26);
+      line.rotation.x=-Math.atan2(1.34,sizeL);
+      ramp.add(line);
+    }
+    scene.add(ramp);
+    epicZones.push({norm,type:'ramp',position:p,width:sizeW,index});
+  });
+  destructibles=[];
+};
+
+// Evitar por completo premios geométricos circulares / cuadrados en medio del asfalto.
+// La recompensa se mantiene al terminar la carrera, como en la versión original.
+createCollectibles = function(){collectibles=[];};
+
+// Las montañas no pueden invadir el asfalto ni las barreras: verificación
+// de distancia a la pista PARA CADA montaña y para su radio completo.
+addReliefMountains = function(track){
+  const theme=track.theme;
+  const colors={desert:0xb98245,city:0x172033,alpine:0x8099a7,
+    volcano:0x4b2622,jungle:0x2e713e,coast:0x3e8244};
+  const rock=new THREE.MeshStandardMaterial({color:colors[theme]||0x537b41,roughness:1});
+  const snowy=new THREE.MeshStandardMaterial({color:0xe8f2ff,roughness:.94});
+  let added=0,tries=0;
+  const count=theme==='city'?10:(theme==='volcano'?30:23);
+  while(added<count && tries++<count*130){
+    const x=-325+Math.random()*650,z=-335+Math.random()*650;
+    const base=19+Math.random()*30;
+    const pt=new THREE.Vector3(x,0,z);
+    if(distanceToTrack(pt).dist<track.width*.5+base+34)continue;
+    const h=(theme==='alpine'?25:theme==='desert'?17:13)+Math.random()*(theme==='alpine'?38:25);
+    const hill=new THREE.Mesh(new THREE.ConeGeometry(base,h,13),rock);
+    hill.position.set(x,h/2-.8,z);hill.rotation.y=Math.random()*Math.PI;
+    hill.receiveShadow=true;scene.add(hill);
+    if(theme==='alpine' && added%2===0){
+      const cap=new THREE.Mesh(new THREE.ConeGeometry(base*.43,h*.31,13),snowy);
+      cap.position.set(x,h*.81,z);scene.add(cap);
+    }
+    added++;
+  }
+};
+
+// Sistema sencillo de salto balístico por vehículo (jugador y rivales).
+// El humo se genera al CONTACTAR el suelo, no solo mientras el coche está en el aire.
+function upgradeVehicleWheels(car,dt,steer){
+  const group=car?.group;
+  if(!group)return;
+  const speed=car.speed||0;
+  for(const w of group.userData.upgradeWheels||[]){
+    const desired=w.front?THREE.MathUtils.clamp(steer,-.48,.48):0;
+    w.pivot.rotation.y=THREE.MathUtils.damp(w.pivot.rotation.y,desired,12,dt);
+    w.rotating.rotation.x+=speed*dt/(group.userData.wheelRadius||.38);
+  }
+  group.rotation.z=THREE.MathUtils.damp(group.rotation.z,-steer*Math.min(Math.abs(speed)/55,1)*.055,5,dt);
+}
+function upgradeJumpStep(car,dt){
+  if(!car?.group)return;
+  const current=car.group.position;
+  car._rampCooldowns=car._rampCooldowns||new Map();
+  for(const z of epicZones){
+    const cooldown=Math.max(0,(car._rampCooldowns.get(z.index)||0)-dt);
+    car._rampCooldowns.set(z.index,cooldown);
+    if(cooldown>0 || car._airVel>0 || car._airHeight>.01 || Math.abs(car.speed)<19)continue;
+    const dx=current.x-z.position.x,dz=current.z-z.position.z;
+    const distance=Math.sqrt(dx*dx+dz*dz);
+    // Únicamente salta si pisa la rampa, no por pasar al lado.
+    if(distance<3.45 && distanceToTrack(current).dist<z.width*.48){
+      car._rampCooldowns.set(z.index,3.3);
+      car._airVel=7.7+Math.min(2.7,Math.abs(car.speed)*.035);
+      car._airHeight=.05;
+      if(car.id==='player'){
+        raceStats.jumps=(raceStats.jumps||0)+1;
+        toast('¡SALTO!');
+      }
+    }
+  }
+  if(car._airHeight>0 || (car._airVel||0)>0){
+    car._airHeight=(car._airHeight||0)+(car._airVel||0)*dt;
+    car._airVel=(car._airVel||0)-19.0*dt;
+    if(car.id==='player')raceStats.airTime=(raceStats.airTime||0)+dt;
+    if(car._airHeight<=0){
+      car._airHeight=0;car._airVel=0;
+      const f=racerForward(car);
+      for(const off of [-.5,0,.5]){
+        const where=current.clone().add(new THREE.Vector3(off,.03,0));
+        spawnSmoke(where,f,true);
+      }
+      if(car.id==='player')toast('¡ATERRIZAJE!');
+    }
+    current.y=.45+car._airHeight;
+    car.group.rotation.x=THREE.MathUtils.damp(car.group.rotation.x,
+      (car._airVel||0)>0?-.095:.045,6,dt);
+  }else{
+    current.y=.45;
+    car.group.rotation.x=THREE.MathUtils.damp(car.group.rotation.x,0,8,dt);
+  }
+}
+const upgradeOriginalUpdatePlayer=updatePlayer;
+updatePlayer=function(dt){
+  upgradeOriginalUpdatePlayer(dt);
+  if(!player)return;
+  const steer=(keys.a||keys.arrowleft?1:0)-(keys.d||keys.arrowright?1:0);
+  upgradeVehicleWheels(player,dt,steer*.4);
+};
+const upgradeOriginalUpdateAI=updateAI;
+updateAI=function(dt){
+  upgradeOriginalUpdateAI(dt);
+  for(const a of aiCars){
+    const diff=THREE.MathUtils.euclideanModulo(a.group.rotation.y-(a._lastYaw??a.group.rotation.y)+Math.PI,Math.PI*2)-Math.PI;
+    a._lastYaw=a.group.rotation.y;
+    upgradeVehicleWheels(a,dt,THREE.MathUtils.clamp(diff/Math.max(dt,.01)*.13,-.4,.4));
+  }
+};
+const upgradeOriginalUpdateRace=updateRace;
+updateRace=function(dt){
+  upgradeOriginalUpdateRace(dt);
+  if(!raceFinished){
+    upgradeJumpStep(player,dt);
+    for(const ai of aiCars)upgradeJumpStep(ai,dt);
+  }
+};
+
+// Perfiles de sonido: tres grabaciones suministradas, asignadas a cinco
+// vehículos. La velocidad, la aceleración y el nitro modifican pitch y volumen.
+const UPGRADE_ENGINE_PROFILES={
+  comet:{file:'motor_v12.mp3',pitch:.94,volume:.36},
+  rally:{file:'motor_aceleracion.mp3',pitch:1.10,volume:.36},
+  muscle:{file:'motor_v12.mp3',pitch:.78,volume:.46},
+  drift:{file:'motor_cambios.mp3',pitch:1.14,volume:.31},
+  police:{file:'motor_v12.mp3',pitch:.98,volume:.38}
+};
+// Cada vehículo tiene un perfil distinto, aun si comparte grabación.
+let upgradeAudioVoices=[];
+function upgradeMakeVoice(carId){
+  const profile=UPGRADE_ENGINE_PROFILES[carId]||UPGRADE_ENGINE_PROFILES.comet;
+  const audio=new Audio('audio/'+profile.file);
+  audio.loop=true;audio.preload='auto';audio.volume=0;
+  audio.playbackRate=profile.pitch;
+  const voice={audio,profile,carId};
+  // Las acciones empiezan desde el clic de carrera para evitar autoplay bloqueado.
+  audio.play().catch(()=>{});
+  return voice;
+}
+startAudio=function(){
+  try{
+    if(!audioCtx)audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    audioCtx.resume?.();
+    if(engineGain)engineGain.gain.value=0;
+  }catch(e){}
+  for(const v of upgradeAudioVoices){v.audio.pause();v.audio.src='';}
+  upgradeAudioVoices=[];
+  upgradeAudioVoices.push(upgradeMakeVoice(selectedCarId));
+  for(let i=0;i<5;i++)upgradeAudioVoices.push(upgradeMakeVoice(CAR_ORDER[i]));
+};
+stopEngineSound=function(){
+  if(engineGain)engineGain.gain.value=0;
+  for(const voice of upgradeAudioVoices){voice.audio.pause();voice.audio.volume=0;}
+};
+updateEngineSound=function(){
+  if(!player || !upgradeAudioVoices.length)return;
+  const participants=[player,...aiCars];
+  participants.forEach((car,index)=>{
+    let voice=upgradeAudioVoices[index];if(!voice)return;
+    if(voice.carId!==car.carId){
+      const p=UPGRADE_ENGINE_PROFILES[car.carId]||UPGRADE_ENGINE_PROFILES.comet;
+      if(voice.profile.file!==p.file)voice.audio.src='audio/'+p.file;
+      voice.carId=car.carId;voice.profile=p;
+      voice.audio.play().catch(()=>{});
+    }
+    const ratio=THREE.MathUtils.clamp(Math.abs(car.speed)/(car.stats?.maxSpeed||80),0,1.2);
+    const accelerating=index===0?(keys.w||keys.arrowup||car.boostTime>0):true;
+    const pitch=voice.profile.pitch*(.77+ratio*.54+(accelerating?.085:0)+(car.boostTime>0?.09:0));
+    voice.audio.playbackRate=THREE.MathUtils.clamp(pitch,.52,2.25);
+    let volume=0;
+    if(raceStarted&&!raceFinished){
+      if(index===0)volume=voice.profile.volume*(.42+ratio*.58);
+      else{
+        const dist=car.group.position.distanceTo(player.group.position);
+        volume=voice.profile.volume*.20*(1/(1+Math.pow(dist/19,2)));
+      }
+    }
+    voice.audio.volume=THREE.MathUtils.clamp(volume,0,.70);
+  });
+};
+
+// No se elimina la música, los controles, el cronómetro ni el guardado del juego.
+
+initMenu();</script></body></html>
